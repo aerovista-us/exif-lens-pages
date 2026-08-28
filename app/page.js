@@ -38,7 +38,7 @@ function downloadBlob(blob, name) {
 
 async function deepApiFetch(path, options) {
   try {
-    const response = await fetch(`${API_BASE}${path}`, options);
+    const response = await fetch(`${API_BASE}${path}`, { ...options, credentials: "include" });
     if (response.redirected && /cloudflareaccess\.com/i.test(response.url)) throw new Error(DEEP_API_MESSAGE);
     return response;
   } catch (error) {
