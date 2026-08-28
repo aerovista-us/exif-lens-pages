@@ -1,10 +1,10 @@
 "use client";
 
 import { useMemo, useRef, useState } from "react";
-import { canInspectLocally, cleanJpegLocally, inspectJpegLocally } from "./local-exif";
+import { canInspectLocally, cleanLocally, inspectLocally } from "./local-exif";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8787";
-const DEEP_API_MESSAGE = "This file needs the deep ExifTool service, which is currently behind AeroVista Workspace Access. JPEG inspection and cleaning run locally in your browser; the public deep-format API route still needs to be enabled.";
+const DEEP_API_MESSAGE = "This file needs the deep ExifTool service, which is currently behind AeroVista Workspace Access. JPEG and PNG inspection/cleaning run locally in your browser; other formats still need the deep API route.";
 
 function formatValue(value) {
   if (value === null || value === undefined) return "—";
@@ -34,6 +34,13 @@ function downloadBlob(blob, name) {
   anchor.click();
   anchor.remove();
   URL.revokeObjectURL(url);
+}
+
+function localOutputName(file, profile) {
+  const match = String(file.name || "file").match(/^(.*?)(\.(?:jpe?g|png))$/i);
+  const stem = match?.[1] || String(file.name || "file").replace(/\.[^.]+$/, "");
+  const extension = match?.[2]?.toLowerCase() || (file.type === "image/png" ? ".png" : ".jpg");
+  return `${stem}-${profile === "all" ? "metadata-stripped" : "share-safe"}${extension}`;
 }
 
 async function deepApiFetch(path, options) {
@@ -81,7 +88,7 @@ export default function Home() {
 
     try {
       if (canInspectLocally(selected)) {
-        setData(await inspectJpegLocally(selected));
+        setData(await inspectLocally(selected));
         return;
       }
 
@@ -105,9 +112,8 @@ export default function Home() {
 
     try {
       if (canInspectLocally(file)) {
-        const blob = await cleanJpegLocally(file, profile);
-        const stem = file.name.replace(/\.(jpe?g)$/i, "");
-        downloadBlob(blob, `${stem}-${profile === "all" ? "metadata-stripped" : "share-safe"}.jpg`);
+        const blob = await cleanLocally(file, profile);
+        downloadBlob(blob, localOutputName(file, profile));
         return;
       }
 
@@ -149,7 +155,7 @@ export default function Home() {
         <div>
           <p className="eyebrow">SEE WHAT THE FILE REMEMBERS</p>
           <h1>Inspect metadata.<br /><em>Expose the quiet details.</em></h1>
-          <p className="hero-copy">JPEG photos are inspected and cleaned directly in your browser. Other ExifTool-supported files can use the deeper API when its public route is available.</p>
+          <p className="hero-copy">JPEG and PNG images are inspected and cleaned directly in your browser. Other ExifTool-supported files use the deeper API when that route is available.</p>
         </div>
         <div className="hero-orbit" aria-hidden="true"><div className="orbital-core">EXIF</div></div>
       </section>
@@ -210,7 +216,7 @@ export default function Home() {
             <div className="clean-actions">
               <div>
                 <b>Make a share-safe copy</b>
-                <span>{data.processingMode === "local" ? "JPEG cleaning stays on this device. Your original is never modified." : "Your original file is never modified."}</span>
+                <span>{data.processingMode === "local" ? "Local image cleaning stays on this device. Your original is never modified." : "Your original file is never modified."}</span>
               </div>
               <button onClick={() => clean("privacy")} disabled={!!cleaning}>{cleaning === "privacy" ? "Cleaning…" : "Remove privacy metadata"}</button>
               <button className="ghost" onClick={() => clean("all")} disabled={!!cleaning}>{cleaning === "all" ? "Cleaning…" : "Strip all metadata"}</button>
@@ -225,7 +231,7 @@ export default function Home() {
 
             <div className="groups">
               {filteredGroups.map(([group, tags]) => (
-                <details key={group} open={["EXIF", "File", "System", "Composite"].includes(group)}>
+                <details key={group} open={["EXIF", "File", "PNG", "System", "Composite"].includes(group)}>
                   <summary><span>{group}</span><small>{tags.length} tags</small></summary>
                   <div className="tag-table">
                     {tags.map((item) => (
@@ -249,7 +255,7 @@ export default function Home() {
 
       <footer>
         <span>EXIF LENS</span>
-        <p>{data?.processingMode === "local" ? "This JPEG stayed on your device." : "Deep-format files are processed temporarily by the API and removed after the request."}</p>
+        <p>{data?.processingMode === "local" ? "This image stayed on your device." : "Deep-format files are processed temporarily by the API and removed after the request."}</p>
       </footer>
     </main>
   );

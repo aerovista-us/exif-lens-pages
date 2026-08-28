@@ -1,4 +1,5 @@
 const JPEG_TYPES = new Set(["image/jpeg", "image/jpg"]);
+const PNG_TYPES = new Set(["image/png"]);
 
 const TAGS = {
   ifd0: {
@@ -34,10 +35,19 @@ const TAGS = {
 };
 
 const TYPE_SIZES = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8 };
+const PNG_SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10];
+const PNG_PRIVACY_CHUNKS = new Set(["eXIf", "tEXt", "zTXt", "iTXt"]);
+const PNG_ALL_METADATA_CHUNKS = new Set(["eXIf", "tEXt", "zTXt", "iTXt", "tIME"]);
+
+function localFormat(file) {
+  const name = String(file?.name || "").toLowerCase();
+  if (JPEG_TYPES.has(file?.type) || name.endsWith(".jpg") || name.endsWith(".jpeg")) return "jpeg";
+  if (PNG_TYPES.has(file?.type) || name.endsWith(".png")) return "png";
+  return null;
+}
 
 export function canInspectLocally(file) {
-  const name = String(file?.name || "").toLowerCase();
-  return JPEG_TYPES.has(file?.type) || name.endsWith(".jpg") || name.endsWith(".jpeg");
+  return Boolean(localFormat(file));
 }
 
 function textFromBytes(bytes, start, length) {
@@ -48,6 +58,14 @@ function textFromBytes(bytes, start, length) {
     out += String.fromCharCode(code);
   }
   return out.trim();
+}
+
+function utf8FromBytes(bytes, start, length) {
+  try {
+    return new TextDecoder("utf-8", { fatal: false }).decode(bytes.slice(start, start + length)).replace(/\0+$/, "").trim();
+  } catch {
+    return textFromBytes(bytes, start, length);
+  }
 }
 
 function findExifTiff(bytes) {
@@ -191,6 +209,118 @@ function privacy(exif, gps) {
   return { risk, findings, latitude, longitude };
 }
 
+function combinePrivacy(exifScan, textRows = []) {
+  const findings = [...exifScan.findings];
+  const seen = new Set(findings.map((item) => item.key));
+  for (const row of textRows) {
+    const key = String(row.key || "");
+    const normalized = key.toLowerCase();
+    let severity = null;
+    let reason = null;
+    if (/(gps|location|latitude|longitude|coordinate)/.test(normalized)) {
+      severity = "high";
+      reason = "Location metadata";
+    } else if (/(author|creator|owner|artist|comment|description)/.test(normalized)) {
+      severity = "medium";
+      reason = "Potentially identifying text metadata";
+    }
+    if (severity && row.value && !seen.has(key)) {
+      findings.push({ key, value: row.value, severity, reason });
+      seen.add(key);
+    }
+  }
+  const risk = findings.some((item) => item.severity === "high") ? "high" : findings.length ? "medium" : "low";
+  return { ...exifScan, findings, risk };
+}
+
+function isPng(bytes) {
+  return bytes.length >= PNG_SIGNATURE.length && PNG_SIGNATURE.every((value, index) => bytes[index] === value);
+}
+
+function readPngChunks(bytes) {
+  if (!isPng(bytes)) throw new Error("Invalid PNG signature.");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const chunks = [];
+  let offset = 8;
+  while (offset + 12 <= bytes.length) {
+    const length = view.getUint32(offset, false);
+    const dataStart = offset + 8;
+    const dataEnd = dataStart + length;
+    const chunkEnd = dataEnd + 4;
+    if (chunkEnd > bytes.length) throw new Error("Invalid PNG chunk length.");
+    const type = textFromBytes(bytes, offset + 4, 4);
+    chunks.push({ type, length, chunkStart: offset, dataStart, dataEnd, chunkEnd });
+    offset = chunkEnd;
+    if (type === "IEND") break;
+  }
+  return chunks;
+}
+
+function findZero(bytes, start, end) {
+  for (let i = start; i < end; i += 1) if (bytes[i] === 0) return i;
+  return -1;
+}
+
+async function inflateText(bytes) {
+  if (typeof DecompressionStream !== "function") return null;
+  try {
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+    const inflated = new Uint8Array(await new Response(stream).arrayBuffer());
+    return utf8FromBytes(inflated, 0, inflated.length);
+  } catch {
+    return null;
+  }
+}
+
+async function readPngTextChunk(bytes, chunk) {
+  const { type, dataStart, dataEnd } = chunk;
+  const keywordEnd = findZero(bytes, dataStart, dataEnd);
+  if (keywordEnd < 0) return null;
+  const keyword = textFromBytes(bytes, dataStart, keywordEnd - dataStart) || type;
+
+  if (type === "tEXt") {
+    return { key: keyword, tag: keyword, value: textFromBytes(bytes, keywordEnd + 1, dataEnd - keywordEnd - 1) };
+  }
+
+  if (type === "zTXt") {
+    const compressedStart = keywordEnd + 2;
+    if (compressedStart > dataEnd) return null;
+    const inflated = await inflateText(bytes.slice(compressedStart, dataEnd));
+    return { key: keyword, tag: keyword, value: inflated || "[compressed PNG text]" };
+  }
+
+  if (type === "iTXt") {
+    let cursor = keywordEnd + 1;
+    if (cursor + 2 > dataEnd) return null;
+    const compressed = bytes[cursor] === 1;
+    cursor += 2;
+    const languageEnd = findZero(bytes, cursor, dataEnd);
+    if (languageEnd < 0) return null;
+    cursor = languageEnd + 1;
+    const translatedEnd = findZero(bytes, cursor, dataEnd);
+    if (translatedEnd < 0) return null;
+    cursor = translatedEnd + 1;
+    const payload = bytes.slice(cursor, dataEnd);
+    const value = compressed ? await inflateText(payload) : utf8FromBytes(payload, 0, payload.length);
+    return { key: keyword, tag: keyword, value: value || (compressed ? "[compressed PNG international text]" : "") };
+  }
+
+  return null;
+}
+
+function lookupText(rows, ...names) {
+  const wanted = new Set(names.map((name) => name.toLowerCase()));
+  return rows.find((row) => wanted.has(String(row.key || "").toLowerCase()))?.value || null;
+}
+
+function fileRows(file, mimeType) {
+  return [
+    { key: "FileName", tag: "FileName", value: file.name },
+    { key: "FileSize", tag: "FileSize", value: file.size },
+    { key: "MIMEType", tag: "MIMEType", value: mimeType },
+  ];
+}
+
 export async function inspectJpegLocally(file) {
   const bytes = new Uint8Array(await file.arrayBuffer());
   const tiffStart = findExifTiff(bytes);
@@ -200,13 +330,7 @@ export async function inspectJpegLocally(file) {
       processingMode: "local",
       summary: { mimeType: file.type || "image/jpeg", fileType: "JPEG", ...dimensions },
       privacy: { risk: "low", findings: [] },
-      grouped: {
-        File: [
-          { key: "FileName", tag: "FileName", value: file.name },
-          { key: "FileSize", tag: "FileSize", value: file.size },
-          { key: "MIMEType", tag: "MIMEType", value: file.type || "image/jpeg" },
-        ],
-      },
+      grouped: { File: fileRows(file, file.type || "image/jpeg") },
       raw: { local: true, exifPresent: false },
     };
   }
@@ -219,11 +343,7 @@ export async function inspectJpegLocally(file) {
     ? (Number(gps.GPSAltitudeRef) === 1 ? -gps.GPSAltitude : gps.GPSAltitude)
     : null;
   const grouped = {
-    File: [
-      { key: "FileName", tag: "FileName", value: file.name },
-      { key: "FileSize", tag: "FileSize", value: file.size },
-      { key: "MIMEType", tag: "MIMEType", value: file.type || "image/jpeg" },
-    ],
+    File: fileRows(file, file.type || "image/jpeg"),
     EXIF: [...parsed.ifd0.rows, ...parsed.exif.rows],
   };
   if (parsed.gps.rows.length) grouped.GPS = parsed.gps.rows;
@@ -250,6 +370,89 @@ export async function inspectJpegLocally(file) {
   };
 }
 
+export async function inspectPngLocally(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const chunks = readPngChunks(bytes);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const ihdr = chunks.find((chunk) => chunk.type === "IHDR");
+  const width = ihdr && ihdr.length >= 8 ? view.getUint32(ihdr.dataStart, false) : null;
+  const height = ihdr && ihdr.length >= 8 ? view.getUint32(ihdr.dataStart + 4, false) : null;
+  const textRows = [];
+  for (const chunk of chunks) {
+    if (["tEXt", "zTXt", "iTXt"].includes(chunk.type)) {
+      const row = await readPngTextChunk(bytes, chunk);
+      if (row && row.value !== "") textRows.push(row);
+    }
+  }
+
+  let exif = {};
+  let gps = {};
+  let exifRows = [];
+  let gpsRows = [];
+  const exifChunk = chunks.find((chunk) => chunk.type === "eXIf");
+  if (exifChunk) {
+    try {
+      const parsed = parser(bytes, exifChunk.dataStart);
+      exif = { ...parsed.ifd0.values, ...parsed.exif.values };
+      gps = parsed.gps.values;
+      exifRows = [...parsed.ifd0.rows, ...parsed.exif.rows];
+      gpsRows = parsed.gps.rows;
+    } catch {
+      exifRows = [{ key: "eXIf", tag: "eXIf", value: "EXIF chunk present but could not be decoded locally" }];
+    }
+  }
+
+  const scan = combinePrivacy(privacy(exif, gps), textRows);
+  const altitude = typeof gps.GPSAltitude === "number"
+    ? (Number(gps.GPSAltitudeRef) === 1 ? -gps.GPSAltitude : gps.GPSAltitude)
+    : null;
+  const grouped = {
+    File: fileRows(file, file.type || "image/png"),
+    PNG: [
+      { key: "Width", tag: "Width", value: width },
+      { key: "Height", tag: "Height", value: height },
+      { key: "Chunks", tag: "Chunks", value: chunks.map((chunk) => chunk.type).join(", ") },
+    ],
+  };
+  if (textRows.length) grouped.Text = textRows;
+  if (exifRows.length) grouped.EXIF = exifRows;
+  if (gpsRows.length) grouped.GPS = gpsRows;
+
+  return {
+    processingMode: "local",
+    summary: {
+      mimeType: file.type || "image/png",
+      fileType: "PNG",
+      width,
+      height,
+      make: exif.Make || null,
+      model: exif.Model || null,
+      capturedAt: exif.DateTimeOriginal || exif.CreateDate || exif.DateTime || lookupText(textRows, "Creation Time", "DateTime", "Date Created"),
+      software: exif.Software || lookupText(textRows, "Software", "Source"),
+      lensModel: exif.LensModel || null,
+      gpsAltitude: altitude,
+      gpsLatitude: scan.latitude,
+      gpsLongitude: scan.longitude,
+    },
+    privacy: { risk: scan.risk, findings: scan.findings },
+    grouped,
+    raw: {
+      ...exif,
+      ...gps,
+      text: Object.fromEntries(textRows.map((row) => [row.key, row.value])),
+      chunks: chunks.map((chunk) => chunk.type),
+      local: true,
+    },
+  };
+}
+
+export async function inspectLocally(file) {
+  const format = localFormat(file);
+  if (format === "jpeg") return inspectJpegLocally(file);
+  if (format === "png") return inspectPngLocally(file);
+  throw new Error("This file format requires the deep ExifTool service.");
+}
+
 function isMetadataMarker(marker, profile) {
   if (marker === 0xfe) return true;
   if (profile === "privacy") return marker === 0xe1 || marker === 0xed;
@@ -259,7 +462,7 @@ function isMetadataMarker(marker, profile) {
 
 export async function cleanJpegLocally(file, profile = "privacy") {
   const bytes = new Uint8Array(await file.arrayBuffer());
-  if (bytes[0] !== 0xff || bytes[1] !== 0xd8) throw new Error("Local cleaning currently supports JPEG files only.");
+  if (bytes[0] !== 0xff || bytes[1] !== 0xd8) throw new Error("Invalid JPEG file.");
   const parts = [bytes.slice(0, 2)];
   let offset = 2;
   while (offset < bytes.length) {
@@ -289,4 +492,22 @@ export async function cleanJpegLocally(file, profile = "privacy") {
     offset = end;
   }
   return new Blob(parts, { type: file.type || "image/jpeg" });
+}
+
+export async function cleanPngLocally(file, profile = "privacy") {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const chunks = readPngChunks(bytes);
+  const removable = profile === "all" ? PNG_ALL_METADATA_CHUNKS : PNG_PRIVACY_CHUNKS;
+  const parts = [bytes.slice(0, 8)];
+  for (const chunk of chunks) {
+    if (!removable.has(chunk.type)) parts.push(bytes.slice(chunk.chunkStart, chunk.chunkEnd));
+  }
+  return new Blob(parts, { type: file.type || "image/png" });
+}
+
+export async function cleanLocally(file, profile = "privacy") {
+  const format = localFormat(file);
+  if (format === "jpeg") return cleanJpegLocally(file, profile);
+  if (format === "png") return cleanPngLocally(file, profile);
+  throw new Error("This file format requires the deep ExifTool service.");
 }
