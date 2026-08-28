@@ -11,14 +11,17 @@ Static Next.js frontend for the EXIF Lens metadata inspector.
 
 ## Processing model
 
-EXIF Lens is **local-first** for JPEG photos:
+EXIF Lens is **local-first** for JPEG and PNG images:
 
 - JPEG EXIF inspection runs in the browser.
-- JPEG privacy cleaning / metadata stripping runs in the browser.
-- JPEG files do not need to cross the network for those operations.
+- PNG chunk/text/eXIf inspection runs in the browser.
+- JPEG and PNG privacy cleaning / metadata stripping run in the browser.
+- These files do not need to cross the network for supported local operations.
 - Video, PDF, audio, HEIC and other deep-format inspection still use the ExifTool API.
 
-The deep API currently lives behind Cloudflare Access because it is mounted under the protected Workspaces hostname. A public GitHub Pages application cannot safely embed a Cloudflare service token, and an Access login redirect is not a usable `fetch()` response. Therefore the remaining infrastructure fix is a **narrow public EXIF API route or dedicated public hostname**, not a blanket bypass for `workspaces.aerocoreos.com`.
+PNG local inspection understands common `tEXt`, `zTXt`, `iTXt`, and `eXIf` metadata. Local PNG cleaning removes privacy-bearing text/EXIF chunks while preserving image/rendering chunks; the broader strip profile also removes PNG timestamp metadata.
+
+The deep API currently lives behind Cloudflare Access because it is mounted under the protected Workspaces hostname. A public GitHub Pages application cannot safely embed a Cloudflare service token, and cross-site Access cookies are not a reliable public-app integration boundary. Therefore the remaining infrastructure fix is a **narrow public EXIF API route or dedicated public hostname**, not a blanket bypass for `workspaces.aerocoreos.com`.
 
 Any public deep-format route should preserve these controls:
 
