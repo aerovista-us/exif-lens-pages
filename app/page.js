@@ -1,8 +1,10 @@
 "use client";
 
 import { useMemo, useRef, useState } from "react";
+import { canInspectLocally, cleanJpegLocally, inspectJpegLocally } from "./local-exif";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8787";
+const DEEP_API_MESSAGE = "This file needs the deep ExifTool service, which is currently behind AeroVista Workspace Access. JPEG inspection and cleaning run locally in your browser; the public deep-format API route still needs to be enabled.";
 
 function formatValue(value) {
   if (value === null || value === undefined) return "—";
@@ -21,6 +23,28 @@ function SummaryCard({ label, value }) {
       <strong title={formatValue(value)}>{formatValue(value)}</strong>
     </div>
   );
+}
+
+function downloadBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = name;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function deepApiFetch(path, options) {
+  try {
+    const response = await fetch(`${API_BASE}${path}`, options);
+    if (response.redirected && /cloudflareaccess\.com/i.test(response.url)) throw new Error(DEEP_API_MESSAGE);
+    return response;
+  } catch (error) {
+    if (error?.message === DEEP_API_MESSAGE) throw error;
+    throw new Error(DEEP_API_MESSAGE);
+  }
 }
 
 export default function Home() {
@@ -56,12 +80,17 @@ export default function Home() {
     setBusy(true);
 
     try {
+      if (canInspectLocally(selected)) {
+        setData(await inspectJpegLocally(selected));
+        return;
+      }
+
       const form = new FormData();
       form.append("file", selected);
-      const response = await fetch(`${API_BASE}/api/inspect`, { method: "POST", body: form });
+      const response = await deepApiFetch("/api/inspect", { method: "POST", body: form });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error || "Inspection failed.");
-      setData(payload);
+      setData({ ...payload, processingMode: "server" });
     } catch (err) {
       setError(err.message || "Inspection failed.");
     } finally {
@@ -75,10 +104,17 @@ export default function Home() {
     setError("");
 
     try {
+      if (canInspectLocally(file)) {
+        const blob = await cleanJpegLocally(file, profile);
+        const stem = file.name.replace(/\.(jpe?g)$/i, "");
+        downloadBlob(blob, `${stem}-${profile === "all" ? "metadata-stripped" : "share-safe"}.jpg`);
+        return;
+      }
+
       const form = new FormData();
       form.append("file", file);
       form.append("profile", profile);
-      const response = await fetch(`${API_BASE}/api/clean`, { method: "POST", body: form });
+      const response = await deepApiFetch("/api/clean", { method: "POST", body: form });
       if (!response.ok) {
         const payload = await response.json().catch(() => ({}));
         throw new Error(payload.error || "Clean operation failed.");
@@ -88,14 +124,7 @@ export default function Home() {
       const disposition = response.headers.get("content-disposition") || "";
       const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
       const name = encoded ? decodeURIComponent(encoded) : `clean-${file.name}`;
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = name;
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      URL.revokeObjectURL(url);
+      downloadBlob(blob, name);
     } catch (err) {
       setError(err.message || "Clean operation failed.");
     } finally {
@@ -113,26 +142,26 @@ export default function Home() {
     <main className="shell">
       <header className="topbar">
         <div className="brand"><span className="brand-mark">E</span><div><b>EXIF LENS</b><small>metadata inspector</small></div></div>
-        <span className="local-pill">EXIFTOOL · SERVER-SIDE</span>
+        <span className="local-pill">LOCAL-FIRST · EXIFTOOL FALLBACK</span>
       </header>
 
       <section className="hero">
         <div>
           <p className="eyebrow">SEE WHAT THE FILE REMEMBERS</p>
           <h1>Inspect metadata.<br /><em>Expose the quiet details.</em></h1>
-          <p className="hero-copy">Drop a photo, video, PDF, audio file, or other ExifTool-supported file. We surface useful metadata, flag privacy-sensitive fields, and let you make a cleaned copy.</p>
+          <p className="hero-copy">JPEG photos are inspected and cleaned directly in your browser. Other ExifTool-supported files can use the deeper API when its public route is available.</p>
         </div>
         <div className="hero-orbit" aria-hidden="true"><div className="orbital-core">EXIF</div></div>
       </section>
 
       <section
         className={`dropzone ${dragging ? "dragging" : ""}`}
-        onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+        onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
         onDragLeave={() => setDragging(false)}
         onDrop={onDrop}
         onClick={() => pickerRef.current?.click()}
       >
-        <input ref={pickerRef} type="file" hidden onChange={(e) => inspect(e.target.files?.[0])} />
+        <input ref={pickerRef} type="file" hidden onChange={(event) => inspect(event.target.files?.[0])} />
         <div className="drop-icon">＋</div>
         <div>
           <strong>{file ? file.name : "Drop a file here"}</strong>
@@ -179,7 +208,10 @@ export default function Home() {
             )}
 
             <div className="clean-actions">
-              <div><b>Make a share-safe copy</b><span>Your original file is never modified.</span></div>
+              <div>
+                <b>Make a share-safe copy</b>
+                <span>{data.processingMode === "local" ? "JPEG cleaning stays on this device. Your original is never modified." : "Your original file is never modified."}</span>
+              </div>
               <button onClick={() => clean("privacy")} disabled={!!cleaning}>{cleaning === "privacy" ? "Cleaning…" : "Remove privacy metadata"}</button>
               <button className="ghost" onClick={() => clean("all")} disabled={!!cleaning}>{cleaning === "all" ? "Cleaning…" : "Strip all metadata"}</button>
             </div>
@@ -188,7 +220,7 @@ export default function Home() {
           <section className="metadata-section">
             <div className="metadata-toolbar">
               <div><span className="section-number">03</span><h2>Metadata explorer</h2></div>
-              <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search tags or values…" />
+              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search tags or values…" />
             </div>
 
             <div className="groups">
@@ -197,7 +229,7 @@ export default function Home() {
                   <summary><span>{group}</span><small>{tags.length} tags</small></summary>
                   <div className="tag-table">
                     {tags.map((item) => (
-                      <div className="tag-row" key={item.key}>
+                      <div className="tag-row" key={`${group}-${item.key}`}>
                         <code>{item.tag}</code>
                         <span>{formatValue(item.value)}</span>
                       </div>
@@ -215,7 +247,10 @@ export default function Home() {
         </>
       )}
 
-      <footer><span>EXIF LENS</span><p>Files are processed temporarily by the API and removed after the request.</p></footer>
+      <footer>
+        <span>EXIF LENS</span>
+        <p>{data?.processingMode === "local" ? "This JPEG stayed on your device." : "Deep-format files are processed temporarily by the API and removed after the request."}</p>
+      </footer>
     </main>
   );
 }
